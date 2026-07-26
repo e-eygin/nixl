@@ -11,7 +11,27 @@ It is the architecture spec asked for on the tracing thread. It is deliberately 
 the already-merged `nixl::trace` facade, which is an in-process span API and does not attempt
 correlation across processes.
 
-## 1. What exists today
+Two problems are treated separately throughout, because they have different costs and different
+audiences: **visibility inside backends** (stage spans within a plugin, no ids required — §6.3)
+and **request-scoped correlation** (a unique id on the wire — §5 onward). The first is small
+and can land on its own; the second is the protocol work.
+
+## 1. Terminology
+
+"Tracing" is overloaded in NIXL. This document uses these terms and nothing else:
+
+| Term | Meaning |
+| ---- | ------- |
+| `NIXL_TRACE` | The **logging** macro (`NIXL_TRACE << ...`). Unrelated to any of the below. Its name collides with everything else here, which is a real source of confusion. |
+| **span macros** | `NIXL_TRACE_SCOPE` / `NIXL_TRACE_MARK` / `NIXL_TRACE_ATTR` / `NIXL_TRACE_CORRELATION_SCOPE` — the merged `nixl::trace` call-site macros. Core only today. |
+| **in-backend stages** | Spans/markers *inside* a plugin (e.g. libfabric `post_write` begin/end, UCX submit/CQ reap). `NIXL_TRACE_TRANSFER_BEGIN` in PR #1460 is this, for libfabric only. Not possible today — see §6.3. |
+| **transport transfer id** | A plugin-local handle, e.g. libfabric's 16-bit cyclic `post_xfer_id`. Not unique, not global. |
+| **trace context** | The request-scoped, globally unique identity this document introduces (§5). |
+
+Renaming the span macros to `NIXL_SPAN_*` would remove the collision with `NIXL_TRACE`
+logging for a few lines of diff; proposed as a separate cleanup (§10).
+
+## 2. What exists today
 
 Merged in `main` (PRs #1765, #1845, #1852, #1867, #1882):
 
@@ -36,7 +56,7 @@ What it deliberately does **not** do:
 Those three gaps are exactly what this design addresses. NVTX keeps its current role:
 measuring NIXL's own overheads on a profiler timeline.
 
-## 2. Requirements
+## 3. Requirements
 
 | # | Requirement | Source |
 | - | ----------- | ------ |
@@ -49,14 +69,15 @@ measuring NIXL's own overheads on a profiler timeline.
 | R7 | Extensible to all plugins; UCX first; explicit story for every backend | Ovidiu |
 | R8 | A generic, industry-standard export path — OpenTelemetry — not only NVTX/Nsight | Adit, Amazon |
 | R9 | End-to-end: an id injected by Dynamo, carried through vLLM, consumed by NIXL, so an OpenAI request can be followed to the NIXL transfers it caused | Adit, Dynamo team |
-| R10 | Permissively licensed dependencies only (Apache-2.0/MIT/BSD); no GPL | Adit (#1460 licensing) |
+| R10 | Permissively licensed dependencies only (Apache-2.0/MIT/BSD) | Adit (#1460 licensing) |
 | R11 | Zero cost when disabled; no public ABI break; peers on mixed NIXL versions interoperate | NIXL policy |
+| R12 | Visibility *inside* backends, through a stage vocabulary general enough for all known backends — separable from request ids | Alex |
 
 **Non-goals.** Continuous always-on tracing of every transfer at full detail (sampling is
 part of the design); device/in-kernel tracing; replacing telemetry (numeric metrics stay in
 `nixl::telemetry`); replacing NVTX; defining Dynamo's or vLLM's own span trees.
 
-## 3. Design overview
+## 4. Design overview
 
 ```
 Dynamo ingress ──traceparent──► vLLM connector ──trace ctx──► nixlAgent.postXferReq
@@ -92,7 +113,7 @@ vLLM hands NIXL the Dynamo trace context, NIXL's spans become children of the Dy
 span, and an OpenAI request can be followed into NIXL post/complete timings. Piece 3 is what
 adds the receiver side. This is the recommended delivery order.
 
-## 4. Trace context
+## 5. Trace context
 
 ```c++
 namespace nixl::trace {
@@ -117,7 +138,23 @@ oriented). NIXL therefore defines its own compact binary encoding of the same fi
 + 1 bytes, big-endian, no text — and converts to/from `traceparent` at the API boundary.
 Applications that only have a string pass the 55-character `traceparent`; NIXL parses it.
 
-### 4.1 Where the context comes from
+**Why not a partitioned id.** An alternative is to compose the id from parts: a per-worker
+"MSB" handed down by Dynamo plus a per-request "LSB" counter, or a NIXL-internal hash of
+host id and GPU index plus a counter. Both work, and both buy problems that 128 random bits
+do not have: the partitioned scheme needs an allocation authority and a rule for what happens
+when a worker restarts or is rescheduled, the hashed scheme needs the hash inputs to be stable
+and collision-free across a cluster, and either way the counter reintroduces the wrap-around
+ambiguity the width was meant to remove. 128 random bits need no coordination at all, and NIXL
+already ships an RFC 9562 generator (`src/utils/common/uuid_v4.h`) that produces exactly the
+16 cryptographically random bytes required. Width is therefore a settled question, not a
+trade-off: 128 bits for the trace, 64 for the span, as W3C specifies.
+
+A plugin's own transport id is a **separate** thing and stays as it is. libfabric's
+`post_xfer_id` is a 16-bit cyclic counter, per libfabric instance and explicitly not unique;
+widening it is unnecessary. It remains the transport-local key that joins rail completions to
+a notification, and is mapped to the global context (§7.4).
+
+### 5.1 Where the context comes from
 
 Three sources, in priority order:
 
@@ -134,7 +171,18 @@ blob as opaque. That is evidence the id exists and already reaches the peer — 
 blob is the application's own channel, it is only delivered at completion, and NIXL cannot
 key phase timestamps to it. A first-class field is what turns it into a trace.
 
-### 4.2 Public API shape
+**Considered: NIXL-generated ids only, no API change.** Source 2 alone — NIXL invents every id
+and never accepts one — is a legitimate reduced scope, and it is attractive because it touches
+neither NIXL's external API nor Dynamo, and asks nothing of workers. It gives NIXL-internal
+request correlation, including sender ↔ receiver once §7 lands, and it is a fine place to stop
+if the end-to-end ask slips. What it cannot do is R9: with no way to accept an incoming
+context, a NIXL trace can only be joined to the Dynamo request that caused it by timestamp
+correlation and heuristics, which is the hand-rolled analysis this effort exists to replace.
+Since accepting a context is one defaulted field on an existing struct plus a binding keyword,
+the cost being avoided is small and the capability lost is the headline one. Recommendation:
+build source 2 first (it is the default path anyway) and land source 1 in the same phase.
+
+### 5.2 Public API shape
 
 ```c++
 struct nixlAgentOptionalArgs {
@@ -154,7 +202,7 @@ is **not** touched, per the ABI rule the tracing work already follows. Bindings:
 - Rust: `OptArgs::set_trace_context()`.
 - Both also get a getter for the context NIXL generated, so an application can log/join it.
 
-## 5. Request-scoped core plumbing
+## 6. Request-scoped core plumbing
 
 - `nixlXferReqH` gains a `TraceContext` member next to `notifMsg` and the existing
   `nixl_xfer_telem_t`. It is set at request creation and is immutable for the request's life.
@@ -165,7 +213,7 @@ is **not** touched, per the ABI rule the tracing work already follows. Bindings:
   plugin stores it on its own `nixlBackendReqH`, which is what lets its progress thread
   attribute a CQ event to a request.
 
-### 5.1 Phases, and why they must be stamped in the backend
+### 6.1 Phases, and why they must be stamped in the backend
 
 This is the heart of R4/R5. Today a completion is stamped when the application calls
 `getXferStatus` and happens to see success, so the measured in-flight time includes the
@@ -199,7 +247,7 @@ Two API additions follow from the table:
 Timestamps use the existing `nixlTime::nixlDuration` TSC/`cntvct` stopwatch already used by
 telemetry, converted once to wall clock at export, so hot-path cost stays at a counter read.
 
-### 5.2 Sampling
+### 6.2 Sampling
 
 Head-based, decided once per request, recorded in `flags` bit 0 and honoured by every peer:
 
@@ -209,9 +257,36 @@ Head-based, decided once per request, recorded in `flags` bit 0 and honoured by 
 Unsampled requests write no wire bytes and take one branch. This is what makes it safe to
 leave the feature compiled in by default.
 
-## 6. On-the-wire propagation
+### 6.3 In-backend stages, and why they ship first (R12)
 
-### 6.1 Record format
+Today NVTX shows nothing *inside* a plugin: the merged instrumentation is entirely in
+`nixl_agent.cpp`, and backend work appears only as time inside a core span.
+`docs/tracing.md` currently records backend sub-spans as "considered and currently not
+planned". That decision should be reversed — it is the cheapest useful increment in this whole
+document, and it is **independent of trace contexts**: a stage span needs a tracer, not an id.
+
+It is worth being precise about what does and does not exist, because it is easy to assume the
+mechanism is already there. The facade, the plugin-loading machinery and multi-backend fan-out
+all exist and need no change. What does not exist is any path from core into a data plugin:
+`nixlBackendInitParams` carries `localAgent`, `type`, `customParams`, `enableProgTh`,
+`pthrDelay`, `syncMode` and `enableTelemetry_` — and no tracer, sink or trace handle. A plugin
+therefore cannot emit a span, attach an attribute, or push a correlation id today, whatever
+macros it calls. The one-field addition in §6.1 item 2 is the whole prerequisite, and once it
+is in, in-backend stages and per-request phase timestamps are the same mechanism used with and
+without an id.
+
+Because the vocabulary has to suit every backend (R12), stages are defined in core as a closed
+enum, not as free-form strings per plugin: `submit`, `wire.submitted`, `wire.completed`,
+`notif.sent`, `notif.received`, `remote.observed`, plus a generic `stage` with a plugin-supplied
+label for anything genuinely plugin-specific. Backend authors map their internals onto it —
+libfabric `post_write`/`post_read`/`post_send` begin/end fold onto `wire.submitted` /
+`wire.completed` with a rail attribute; UCX maps submit and CQ reap; DOCA maps WQE post and CQ
+poll. A closed enum is what keeps timelines comparable across plugins instead of each backend
+inventing its own labels.
+
+## 7. On-the-wire propagation
+
+### 7.1 Record format
 
 ```
 byte 0      : version (0x01)
@@ -222,7 +297,7 @@ bytes 18-25 : span-id  (8B, big-endian) — the sender's span, becomes the recei
 
 26 bytes, fixed. Version-first so an unknown version is skipped, not misparsed.
 
-### 6.2 Compatibility
+### 7.2 Compatibility
 
 A peer running an older NIXL must not see corrupted control messages (R11). Two mechanisms,
 chosen per plugin by what its format allows:
@@ -242,7 +317,7 @@ Both are per-plugin decisions, which is why the backend engine grows a capabilit
 Core degrades cleanly: sender-side spans and phases still work, receiver spans are simply
 absent, and that is reported once per peer at debug level.
 
-### 6.3 Per-plugin carriers
+### 7.3 Per-plugin carriers
 
 | Plugin | Carrier | Receiver-side event | Effort |
 | ------ | ------- | ------------------- | ------ |
@@ -260,33 +335,50 @@ per transfer just to manufacture one; that would trade the overhead NVTX is used
 for tracing detail. Where an application already asks for a notification (the vLLM connector
 does, on every KV write), the receiver span is free.
 
-### 6.4 Interop with Amazon PR #1460 (R6)
+### 7.4 Interop with Amazon PR #1460 (R6)
 
 #1460's value was request correlation, not its tracepoint library — and its correlation
 mechanism (a transfer id in libfabric immediate data, matched to notifications by expected
-completion counts) is **already merged** in `src/utils/libfabric/`. What was libfabric-specific
-and GPL-encumbered was the *ingest* side (LTTng-UST). This design keeps the mechanism and
-replaces the ingest:
+completion counts) is **already merged** in `src/utils/libfabric/`. What was libfabric-specific,
+and what raised the licensing objection, was the *ingest* side: `liblttng-ust` is LGPL-2.1-only
+(its public headers are MIT, and `lttng-ust-ctl` is GPL-2.0-only). This design keeps the
+mechanism and replaces the ingest:
 
 - The 16-bit `xfer_id` stays the transport-local key that joins rail completions to a
   notification. It is *not* widened.
 - The 128-bit trace id is carried in the notification and mapped to `xfer_id` on both sides,
   so a rail-level CQ event resolves to a request and therefore to a trace.
 - Every event #1460 emitted (`post_write/read/send` begin/end, local and remote completions,
-  submitted counts) becomes a phase timestamp on the sink from §5.1, keyed to the trace
+  submitted counts) becomes a phase timestamp on the sink from §6.1, keyed to the trace
   context, exported through Apache-2.0 OpenTelemetry instead of LTTng (R10).
 
 Amazon should be invited to review this section specifically.
 
-## 7. Export backends
+**An LTTng backend can exist without a licensing problem.** The merged plugin contract is
+`dlopen`-based and has no in-tree registry, so `libtrace_backend_lttng.so` can be built and
+shipped entirely **outside** the NIXL repository and still be selected with
+`NIXL_TRACE_BACKENDS=lttng`. That keeps LGPL-2.1 code out of NIXL's distribution while giving
+Amazon the memory-ring-buffer ingest they want, and it is a better answer than asking them to
+adopt an output mechanism that does not fit their tooling. Two things must land first for such
+a plugin to be able to record what #1460 recorded: the plugin-facing sink (§6.1) so libfabric
+can emit stages at all, and the backend-API transaction context (§6) so those stages carry an
+id. Until then there is nothing for an out-of-tree backend to receive — including via NVTX:
+a plugin cannot reach `pushCorrelationId` today, so `post_xfer_id` values cannot appear in
+NVTX output yet either.
 
-### 7.1 OpenTelemetry backend plugin
+## 8. Export backends
+
+### 8.1 OpenTelemetry backend plugin
 
 `libtrace_backend_otel.so`, implementing the existing `nixlTracePlugin` contract — no new
 plumbing, and the heavy dependency stays out of `libnixl` and is `dlopen`'d only when
 `NIXL_TRACE_BACKENDS=otel`.
 
 - **Library:** `opentelemetry-cpp` (Apache-2.0; v1.28.0, July 2026). Satisfies R10.
+- **No profiler required.** This is the point of adding it: OTLP export needs a collector
+  endpoint, not Nsight. Only the NVTX backend depends on `nsys`, and only for *viewing* — NVTX
+  itself is a no-op stub when no profiler is attached, so an OTLP-only deployment pays nothing
+  for NVTX being compiled in.
 - **Transport:** OTLP/HTTP is the default (protobuf ≥ 3.21.6, libcurl, nlohmann/json, zlib).
   OTLP/gRPC additionally pulls gRPC + abseil and is a build option, not the default; NIXL
   already vendors abseil, so the gRPC path is feasible but heavier.
@@ -313,7 +405,7 @@ schema versioning, and diverges from the ecosystem the moment semconv moves. Rej
 primary path; it remains a fallback if the dependency footprint proves unacceptable in the
 wheel, and the plugin boundary means that decision can be revisited without touching core.
 
-### 7.2 NVTX and Chakra
+### 8.2 NVTX and Chakra
 
 NVTX is unchanged and stays the tool for NIXL's own overheads: it gains the real trace id as
 its correlation payload (instead of a pointer), which makes an Nsight timeline joinable to an
@@ -321,10 +413,20 @@ OTLP trace by id. Chakra remains the offline execution-trace backend; a wire-pro
 globally unique id is exactly what its `chakra_trace_link` step needs, so this design unblocks
 it rather than competing with it.
 
-## 8. Delivery plan
+## 9. Delivery plan
 
-Each item is a reviewable PR under the repo's 500-line limit, stacked in order. Phases 1 and 2
-are independently useful and are what unblock the Dynamo ask.
+Each item is a reviewable PR under the repo's 500-line limit. Phase 0 is independent of
+everything else and can run in parallel; phases 1 and 2 are what unblock the Dynamo ask.
+
+**Phase 0 — in-backend visibility, no ids involved (R12).**
+
+0a. Plugin-facing sink + stage enum in `nixlBackendInitParams`, `NIXL_PLUGIN_API_VERSION` bump,
+    core forwarding to the tracer. This is also item 7 below; whichever phase lands first
+    carries it.
+0b. UCX stages (submit, CQ reap) as the reference mapping, with a gtest asserting stage spans
+    appear under NVTX; validates the vocabulary on a non-libfabric backend.
+0c. libfabric stages mapped onto the same enum; `docs/tracing.md` amended to drop the
+    "backend sub-spans not planned" note.
 
 **Phase 1 — sender-side end-to-end (no wire change).**
 
@@ -353,7 +455,7 @@ are independently useful and are what unblock the Dynamo ask.
 **Phase 4 — breadth.** Chakra backend consuming the same ids; overhead benchmark in CI
 (sampled and unsampled); nixlbench integration.
 
-## 9. Open questions for review
+## 10. Open questions for review
 
 1. **Who owns id generation** when the application supplies nothing — NIXL, or should NIXL
    refuse to invent one and stay purely a propagator?
@@ -364,14 +466,18 @@ are independently useful and are what unblock the Dynamo ask.
    `traceparent` string/blob only (current proposal)?
 4. **Receiver spans without notifications.** Accept the gap for plain RDMA, or offer an opt-in
    "trace control message" for users who want receiver visibility and will pay for it?
-5. **OTLP transport default** — HTTP (lighter deps) vs gRPC (what most collectors expect).
-6. **Wheel policy** for the OTel plugin: optional system package (proposal) or bundled?
-7. **Semantic conventions.** Should `nixl.*` attributes be proposed upstream to OpenTelemetry
+5. **Stage vocabulary.** Closed enum owned by core (proposal) or free-form labels per plugin?
+   The enum keeps timelines comparable; the labels are less work for plugin authors.
+6. **Macro naming.** Rename `NIXL_TRACE_SCOPE`/`_MARK`/`_ATTR` to `NIXL_SPAN_*` so they stop
+   colliding with the `NIXL_TRACE` logging macro? Mechanical, and cheaper now than later.
+7. **OTLP transport default** — HTTP (lighter deps) vs gRPC (what most collectors expect).
+8. **Wheel policy** for the OTel plugin: optional system package (proposal) or bundled?
+9. **Semantic conventions.** Should `nixl.*` attributes be proposed upstream to OpenTelemetry
    semconv, or aligned with whatever Dynamo already emits?
-8. **Ownership.** Core (context, phases, API) vs plugin owners (per-plugin carriers) —
-   Phase 3 items 11–13 need named owners per plugin.
+10. **Ownership.** Core (context, phases, API) vs plugin owners (per-plugin carriers) —
+    Phase 3 items 11–13 need named owners per plugin.
 
-## 10. Appendix: which review feedback is already in the merged PRs
+## 11. Appendix: which review feedback is already in the merged PRs
 
 | Feedback | State |
 | -------- | ----- |
@@ -379,9 +485,13 @@ are independently useful and are what unblock the Dynamo ask.
 | Correlate spans emitted on different threads | **Done** — `pushCorrelationId`/`CorrelationScope`, used for post → completion |
 | Backend-agnostic correlation API (not an NVTX concept) | **Done** — id lives in the facade, NVTX renders it as a payload |
 | Don't require Nsight to consume traces | **Partly** — the contract allows any backend; this design adds the generic one (R8) |
-| Request-scoped id, generated once or supplied by the app | **Not done** — §4, §5 |
-| Propagate on the wire, sender ↔ receiver | **Not done** — §6 |
-| Per-phase timestamps emitted by the backend, keyed to the id | **Not done** — §5.1 |
-| Accurate in-flight duration | **Not done** — §5.1, and the reason the phase sink is plugin-facing |
-| Equivalence with #1460 incl. libfabric immediate-data interop | **Not done** — §6.4 |
-| Extensibility to other plugins, UCX first | **Not done** — §6.3 |
+| Request-scoped id, generated once or supplied by the app | **Not done** — §5, §6 |
+| Propagate on the wire, sender ↔ receiver | **Not done** — §7 |
+| Per-phase timestamps emitted by the backend, keyed to the id | **Not done** — §6.1 |
+| Accurate in-flight duration | **Not done** — §6.1, and the reason the phase sink is plugin-facing |
+| Equivalence with #1460 incl. libfabric immediate-data interop | **Not done** — §7.4 |
+| Extensibility to other plugins, UCX first | **Not done** — §7.3 |
+| Visibility inside backends (in-backend stages) | **Not done, and not yet possible** — nothing is passed to plugins; §6.3 |
+| Backend API carries a core-provided transaction id, backend picks which id to use | **Not done** — agreed; §6, §7.4 |
+| `post_xfer_id` values surfaced through NVTX as an interim step | **Not possible today** — plugins cannot reach the tracer; needs §6.1 item 2 first |
+| An out-of-tree LTTng backend to avoid the licensing issue | **Already supported** by the plugin contract, once §6.1/§6 land; §7.4 |
