@@ -39,6 +39,9 @@ class Tracer;
 inline constexpr std::uint8_t traceContextWireVersion = 0x01;
 inline constexpr std::size_t traceContextWireSize = 26;
 
+inline constexpr std::string_view traceSampleRatioVar = "NIXL_TRACE_SAMPLE_RATIO";
+inline constexpr std::string_view otelTracesSampleRatioVar = "OTEL_TRACES_SAMPLE_RATIO";
+
 /**
  * @brief Outcome of decoding a wire record. UnknownVersion is a record written
  *        by a peer speaking a later version and must be ignored rather than
@@ -93,8 +96,31 @@ encodeTraceContext(const TraceContext &context, std::span<std::uint8_t> buffer);
 [[nodiscard]] WireDecodeResult
 decodeTraceContext(std::span<const std::uint8_t> buffer, TraceContext &context);
 
+/**
+ * @brief Head-based sampling decision, derived from the context's own trace id
+ *        rather than from a random draw, so it needs no shared generator state
+ *        and every peer inspecting the same context agrees with it.
+ */
+[[nodiscard]] bool
+sampledByRatio(const TraceContext &context, double ratio) noexcept;
+
+/**
+ * @brief Resolve the sampling ratio: traceSampleRatioVar when set, else
+ *        otelTracesSampleRatioVar, which an OpenTelemetry deployment (e.g.
+ *        Dynamo) already sets process-wide with the same [0, 1] head-sampling
+ *        meaning. Setting traceSampleRatioVar empty is an explicit "off" that
+ *        beats that fallback, matching how NIXL_TRACE_BACKENDS is treated.
+ * @return The resolved ratio, or 0 (sample nothing) when neither is usable.
+ * @throws std::invalid_argument when traceSampleRatioVar holds anything other
+ *         than a number in [0, 1], so a caller who asked for sampling is not
+ *         silently given none. A bad value in the shared OpenTelemetry variable
+ *         only warns: NIXL does not own it and must not fail construction on it.
+ */
+[[nodiscard]] double
+resolveTraceSampleRatio();
+
 [[nodiscard]] TraceContext
-generateTraceContext();
+generateTraceContext(double sample_ratio = 0.0);
 
 } // namespace nixl::trace
 

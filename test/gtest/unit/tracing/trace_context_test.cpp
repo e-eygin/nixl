@@ -19,11 +19,15 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "common.h"
 #include "tracing/trace_context.h"
 
 constexpr char kCanonicalTraceparent[] = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -39,6 +43,44 @@ canonicalContext() {
     const auto context = nixl::trace::parseTraceparent(kCanonicalTraceparent);
     return context.value();
 }
+
+// Fills the eight bytes the sampling decision is derived from, keeping the
+// trace id non-zero (hence valid) even when those bytes are all zero.
+[[nodiscard]] nixl::trace::TraceContext
+contextWithTraceIdPrefix(std::uint8_t prefix_byte) {
+    nixl::trace::TraceContext context;
+    context.traceId.fill(prefix_byte);
+    context.traceId[15] = 0x01;
+    context.spanId.fill(0x01);
+    context.flags = 0x02;
+    return context;
+}
+
+// ScopedEnv can only set a variable, so the genuinely-unset path needs its own
+// guard; the ambient value is restored either way.
+class ScopedUnsetEnv {
+public:
+    explicit ScopedUnsetEnv(std::string name) : name_(std::move(name)) {
+        if (const char *value = std::getenv(name_.c_str()); value != nullptr) {
+            previous_ = value;
+        }
+        ::unsetenv(name_.c_str());
+    }
+
+    ~ScopedUnsetEnv() {
+        if (previous_) {
+            ::setenv(name_.c_str(), previous_->c_str(), 1);
+        }
+    }
+
+    ScopedUnsetEnv(const ScopedUnsetEnv &) = delete;
+    ScopedUnsetEnv &
+    operator=(const ScopedUnsetEnv &) = delete;
+
+private:
+    std::string name_;
+    std::optional<std::string> previous_;
+};
 
 } // namespace
 
@@ -369,4 +411,124 @@ TEST(TraceContext, DropsReservedFlagBitsAcrossWireRoundTrip) {
     nixl::trace::TraceContext decoded;
     ASSERT_EQ(nixl::trace::decodeTraceContext(buffer, decoded), nixl::trace::WireDecodeResult::Ok);
     EXPECT_EQ(decoded.flags, 0x03);
+}
+
+TEST(TraceContext, SampleRatioBoundsDecideEverythingOrNothing) {
+    for (std::size_t index = 0; index < 32; ++index) {
+        const auto context = nixl::trace::generateTraceContext();
+        EXPECT_FALSE(nixl::trace::sampledByRatio(context, 0.0));
+        EXPECT_TRUE(nixl::trace::sampledByRatio(context, 1.0));
+    }
+}
+
+TEST(TraceContext, FractionalRatioSplitsOnTraceIdPrefix) {
+    EXPECT_TRUE(nixl::trace::sampledByRatio(contextWithTraceIdPrefix(0x00), 0.5));
+    EXPECT_FALSE(nixl::trace::sampledByRatio(contextWithTraceIdPrefix(0xff), 0.5));
+}
+
+TEST(TraceContext, FractionalRatioProducesBothOutcomes) {
+    bool sampled_seen = false;
+    bool unsampled_seen = false;
+
+    for (std::size_t index = 0; index < 512 && !(sampled_seen && unsampled_seen); ++index) {
+        if (nixl::trace::generateTraceContext(0.5).sampled()) {
+            sampled_seen = true;
+        } else {
+            unsampled_seen = true;
+        }
+    }
+
+    EXPECT_TRUE(sampled_seen);
+    EXPECT_TRUE(unsampled_seen);
+}
+
+TEST(TraceContext, SampleDecisionIsStableAndIgnoresSpanId) {
+    const auto context = canonicalContext();
+    const bool decision = nixl::trace::sampledByRatio(context, 0.5);
+
+    EXPECT_EQ(nixl::trace::sampledByRatio(context, 0.5), decision);
+
+    auto span_changed = context;
+    span_changed.spanId[0] ^= 0xff;
+    EXPECT_EQ(nixl::trace::sampledByRatio(span_changed, 0.5), decision);
+}
+
+TEST(TraceContext, InvalidContextIsNeverSampled) {
+    EXPECT_FALSE(nixl::trace::sampledByRatio(nixl::trace::TraceContext{}, 1.0));
+}
+
+TEST(TraceContext, GeneratedContextCarriesSampledFlag) {
+    const auto sampled = nixl::trace::generateTraceContext(1.0);
+    EXPECT_EQ(sampled.flags, 0x03);
+    EXPECT_TRUE(sampled.sampled());
+
+    const auto unsampled = nixl::trace::generateTraceContext();
+    EXPECT_EQ(unsampled.flags, 0x02);
+    EXPECT_FALSE(unsampled.sampled());
+}
+
+TEST(TraceContext, SampleRatioIsOffWhenUnset) {
+    const ScopedUnsetEnv no_nixl_ratio{std::string(nixl::trace::traceSampleRatioVar)};
+    const ScopedUnsetEnv no_otel_ratio{std::string(nixl::trace::otelTracesSampleRatioVar)};
+
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 0.0);
+}
+
+TEST(TraceContext, SampleRatioParsesOwnVariable) {
+    const ScopedUnsetEnv no_otel_ratio{std::string(nixl::trace::otelTracesSampleRatioVar)};
+    gtest::ScopedEnv env;
+
+    env.addVar(std::string(nixl::trace::traceSampleRatioVar), "0.25");
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 0.25);
+    env.popVar();
+
+    env.addVar(std::string(nixl::trace::traceSampleRatioVar), "1");
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 1.0);
+    env.popVar();
+
+    env.addVar(std::string(nixl::trace::traceSampleRatioVar), "0");
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 0.0);
+}
+
+TEST(TraceContext, SampleRatioRejectsOwnInvalidVariable) {
+    const ScopedUnsetEnv no_otel_ratio{std::string(nixl::trace::otelTracesSampleRatioVar)};
+    gtest::ScopedEnv env;
+
+    for (const char *value : {"abc", "1.5", "-0.1", "nan", "0.5x"}) {
+        env.addVar(std::string(nixl::trace::traceSampleRatioVar), value);
+        EXPECT_THROW(static_cast<void>(nixl::trace::resolveTraceSampleRatio()),
+                     std::invalid_argument)
+            << "value " << value;
+        env.popVar();
+    }
+}
+
+// An OpenTelemetry deployment (Dynamo) already sets this process-wide with the
+// same meaning, so NIXL inherits it instead of requiring a second knob.
+TEST(TraceContext, SampleRatioFallsBackToOtelVariable) {
+    const ScopedUnsetEnv no_nixl_ratio{std::string(nixl::trace::traceSampleRatioVar)};
+    gtest::ScopedEnv env;
+
+    env.addVar(std::string(nixl::trace::otelTracesSampleRatioVar), "0.5");
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 0.5);
+}
+
+TEST(TraceContext, OwnVariableOverridesOtelVariable) {
+    gtest::ScopedEnv env;
+    env.addVar(std::string(nixl::trace::otelTracesSampleRatioVar), "1");
+
+    env.addVar(std::string(nixl::trace::traceSampleRatioVar), "0.25");
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 0.25);
+    env.popVar();
+
+    env.addVar(std::string(nixl::trace::traceSampleRatioVar), "");
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 0.0);
+}
+
+TEST(TraceContext, InvalidOtelVariableIsIgnoredNotFatal) {
+    const ScopedUnsetEnv no_nixl_ratio{std::string(nixl::trace::traceSampleRatioVar)};
+    gtest::ScopedEnv env;
+
+    env.addVar(std::string(nixl::trace::otelTracesSampleRatioVar), "not-a-ratio");
+    EXPECT_EQ(nixl::trace::resolveTraceSampleRatio(), 0.0);
 }

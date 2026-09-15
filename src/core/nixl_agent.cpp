@@ -176,7 +176,8 @@ makeAgentTracer(const std::string &name) {
     if (requested_backends.empty()) {
         return nullptr;
     }
-    return nixl::trace::makeTracer(nixl::trace::TracerConfig{name, std::move(requested_backends)});
+    return nixl::trace::makeTracer(nixl::trace::TracerConfig{
+        name, std::move(requested_backends), nixl::trace::resolveTraceSampleRatio()});
 }
 
 // The settings the manager and its backends need, taken at construction so they
