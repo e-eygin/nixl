@@ -38,5 +38,12 @@ run_command('sh', '-c',
                 check: true
             )
 
+shared_library('libtrace_backend_recorder', ['trace_recorder_plugin.cpp'],
+               dependencies: [nixl_common_dep],
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               name_prefix: '',
+               install: true,
+               install_dir: plugin_install_dir)
+
 source_root = meson.project_source_root()
 mocks_dep = declare_dependency(variables : {'path' : meson.current_source_dir().split(source_root + '/')[1]})
