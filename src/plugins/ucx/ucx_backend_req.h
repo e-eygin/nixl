@@ -35,6 +35,8 @@ public:
     // Empty if there is no pending notification.
     std::string notif;
 
+    std::optional<nixl::trace::TraceContext> traceContext;
+
 #ifdef HAVE_UCX_SGL_API
     std::optional<nixl::ucx::sglXfer> sgl;
 #endif
