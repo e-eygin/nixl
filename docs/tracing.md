@@ -306,7 +306,7 @@ ninja -C build test/gtest/unit/unit test/gtest/gtest
 # real-agent NVTX suite (loads libtrace_backend_nvtx.so from the build tree):
 ./build/test/gtest/gtest --tests_plugin_dirs=build/test/gtest/mocks \
     --gtest_filter='*TestTransferTracing*'
-# two-process UCX test, one trace id on both agents:
+# UCX tests: one trace id on two agents, and the sender's phases:
 ./build/test/gtest/gtest --tests_plugin_dirs=build/test/gtest/mocks \
     --gtest_filter='ucxTraceContextPropagation.*'
 ```
@@ -314,10 +314,14 @@ ninja -C build test/gtest/unit/unit test/gtest/gtest
 The two-process test starts its receiver agent as a separate executable,
 `ucx_trace_receiver`, which is built and installed next to `gtest`, and checks the
 spans both agents record against the sender's request; with `-Dwith_trace=false`,
-which compiles the sender's span out, it checks the receiver's alone. Both agents
-trace through `recorder`, a test-only backend (`libtrace_backend_recorder.so` in the
-mocks directory) that appends one line per finished span to the file named by
-`NIXL_TEST_TRACE_FILE`; the test sets both variables itself.
+which compiles the sender's `postXferReq` span out, it checks only the phases, which
+go through the sink either way. Two single-process tests in the same suite check the
+sender's phases on a transfer to itself: `nixl::submit` and `nixl::wire.submitted`
+once per post, `nixl::notif.sent` once per notifying post, and none of them for an
+unsampled request or with tracing off. The agents trace through `recorder`, a
+test-only backend (`libtrace_backend_recorder.so` in the mocks directory) that
+appends one line per finished span to the file named by `NIXL_TEST_TRACE_FILE`; the
+tests set both variables themselves.
 
 When `nsys` is available, a `tracing_nsys` CTest additionally profiles the real-agent
 test and writes `build/test/gtest/artifacts/nixl_nvtx.nsys-rep` (skipped automatically
