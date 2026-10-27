@@ -304,10 +304,15 @@ and otherwise from the first status check that finds it complete, so
 execution number. UCX records `nixl::wire.completed` only where a thread other
 than the application's sees a transfer complete: on the thread-pool engine, for
 a post split across its dedicated workers (at least `split_batch_size`
-descriptors), from the dedicated thread whose chunk completes it last. It
-records none for a post that fails or is released in flight, and none on the
-default engine, where a transfer is seen to complete only when the application
-checks its status, so a stamp would time the poll rather than the transport.
+descriptors), from the dedicated thread whose chunk completes it last; and,
+while the progress thread runs (`useProgThread`), for every other post, when
+the flush behind its puts or gets completes, or in `postXfer` if that flush
+completes at once. It records none for a post that fails or is released in
+flight, and none without the progress thread for a post that is not split, as
+on the default engine, where a transfer is seen to complete only when the
+application checks its status, so a stamp would time the poll rather than the
+transport. A transfer can complete before `postXfer` records
+`nixl::wire.submitted`, so `nixl::wire.completed` can come first.
 
 A backend that carries the context to its peer says so by overriding
 `supportsTraceContext()`, which defaults to `false`; core reads it once, when
@@ -443,6 +448,6 @@ In NIXL tracing, "correlation" can mean two different things:
 
 - **Backend phase emission** — UCX records `nixl::submit`, `nixl::wire.submitted`,
   `nixl::notif.sent` and `nixl::notif.received` through the sink described under
-  "Backend phases". UCX records `nixl::wire.completed` only for the thread-pool
-  engine's split posts (see "Backend phases"); the other backends record no phases
-  yet.
+  "Backend phases". UCX records `nixl::wire.completed` for every post while the
+  progress thread runs, and otherwise only for the thread-pool engine's split
+  posts (see "Backend phases"); the other backends record no phases yet.

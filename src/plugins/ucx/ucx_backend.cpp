@@ -406,6 +406,14 @@ recordPhase(nixlBackendTraceSink *sink,
 
 } // namespace
 
+void
+nixlUcxBackendReqH::flushCallback(void *, ucs_status_t status, void *user_data) noexcept {
+    if (status == UCS_OK) {
+        const auto &handle = *static_cast<const nixlUcxBackendReqH *>(user_data);
+        recordPhase(handle.wireCompletedSink, nixl_trace_phase_t::WIRE_COMPLETED, handle);
+    }
+}
+
 nixl_status_t nixlUcxEngine::prepXfer (const nixl_xfer_op_t &operation,
                                        const nixl_meta_dlist_t &local,
                                        const nixl_meta_dlist_t &remote,
@@ -619,6 +627,10 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
     int_handle->traceContext = sampledTraceContext(traceSink_, opt_args);
     int_handle->traceRequestId = int_handle->traceContext ? opt_args->traceRequestId : 0;
     int_handle->traceExecution = int_handle->traceContext ? opt_args->traceExecution : 0;
+    int_handle->wireCompletedSink =
+        (int_handle->traceContext && hasProgressThread() && !int_handle->isComposite()) ?
+        traceSink_ :
+        nullptr;
     recordPhase(traceSink_, nixl_trace_phase_t::SUBMIT, *int_handle);
 
     // TODO: assert that handle is empty/completed, as we can't post request before completion
