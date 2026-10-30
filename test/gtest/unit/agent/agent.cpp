@@ -1192,6 +1192,48 @@ namespace agent {
         EXPECT_EQ(agent->releaseXferReq(req), NIXL_SUCCESS);
     }
 
+    TEST_F(sampledRecorderTracingAgentFixture, PluginIsHandedEachCallsIdentity) {
+        nixlAgent *agent = agent_helper_->getAgent();
+        nixlXferReqH *created = nullptr;
+        ASSERT_EQ(agent_helper_->createSelfXferReq(setup_, created), NIXL_SUCCESS);
+        nixlDlistH *local_side = nullptr;
+        nixlDlistH *remote_side = nullptr;
+        ASSERT_EQ(agent->prepXferDlist(setup_.xferDlist, local_side), NIXL_SUCCESS);
+        ASSERT_EQ(agent->prepXferDlist(local_agent_name, setup_.xferDlist, remote_side),
+                  NIXL_SUCCESS);
+        const std::vector<int> indices{0};
+        nixlXferReqH *made = nullptr;
+        ASSERT_EQ(
+            agent->makeXferReq(
+                NIXL_WRITE, *local_side, indices, *remote_side, indices, made, &setup_.extraParams),
+            NIXL_SUCCESS);
+
+        EXPECT_EQ(agent->postXferReq(created), NIXL_SUCCESS);
+        const auto first = created->trace().postContext();
+        EXPECT_EQ(agent->postXferReq(created), NIXL_SUCCESS);
+        const auto second = created->trace().postContext();
+        EXPECT_EQ(agent->postXferReq(made), NIXL_SUCCESS);
+        EXPECT_NE(second.spanId, created->trace().context().spanId);
+
+        const auto identityOf = [](const nixl::trace::TraceContext &context,
+                                   const nixlXferReqH *req,
+                                   std::uint64_t execution) {
+            return testing::Optional(
+                testing::FieldsAre(context, req->trace().requestId(), execution));
+        };
+        EXPECT_THAT(agent_helper_->getGMockEngine().observedTraceIdentities(),
+                    testing::ElementsAre(identityOf(created->trace().context(), created, 0),
+                                         identityOf(made->trace().context(), made, 0),
+                                         identityOf(first, created, 1),
+                                         identityOf(second, created, 2),
+                                         identityOf(made->trace().context(), made, 1)));
+
+        EXPECT_EQ(agent->releaseXferReq(made), NIXL_SUCCESS);
+        EXPECT_EQ(agent->releaseXferReq(created), NIXL_SUCCESS);
+        EXPECT_EQ(agent->releasedDlistH(local_side), NIXL_SUCCESS);
+        EXPECT_EQ(agent->releasedDlistH(remote_side), NIXL_SUCCESS);
+    }
+
     class singleAgentSessionFixture : public testing::Test {
     protected:
         std::unique_ptr<agentHelper> agent_helper_;
@@ -1346,6 +1388,10 @@ namespace agent {
         EXPECT_EQ(req->trace().execution(), 0u);
         EXPECT_THAT(agent_helper_->getGMockEngine().observedTraceRequests(),
                     testing::ElementsAre(testing::Pair(0u, 0u), testing::Pair(0u, 0u)));
+        const auto zeroed =
+            testing::Optional(testing::FieldsAre(nixl::trace::TraceContext{}, 0u, 0u));
+        EXPECT_THAT(agent_helper_->getGMockEngine().observedTraceIdentities(),
+                    testing::ElementsAre(zeroed, zeroed));
         EXPECT_EQ(agent_->releaseXferReq(req), NIXL_SUCCESS);
     }
 

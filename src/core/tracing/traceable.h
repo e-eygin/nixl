@@ -65,6 +65,11 @@ public:
         return execution_.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] TraceIdentity
+    identity() const noexcept {
+        return {postContext_, requestId_, execution()};
+    }
+
     [[nodiscard]] TraceContext
     nextPostContext(const Tracer *tracer) const {
         return (context_.sampled() && spanIdUsed_) ? generatePostContext(context_, tracer) :
